@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="theme-color" content="#2563eb">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>發票掃描器</title>
+<style>
+  body{font-family:system-ui,"Noto Sans TC",sans-serif;max-width:720px;margin:0 auto;padding:16px;background:#f6f7f9;color:#222}
+  h1{font-size:20px}
+  .card{background:#fff;border-radius:12px;padding:14px;margin-bottom:14px;box-shadow:0 1px 3px #0002}
+  video,canvas#prev{width:100%;border-radius:8px;background:#000}
+  button{padding:10px 14px;border:0;border-radius:8px;background:#2563eb;color:#fff;font-size:15px;margin:4px 4px 4px 0}
+  button.gray{background:#64748b}
+  label{display:block;margin:8px 0 2px;font-size:13px;color:#555}
+  input{width:100%;box-sizing:border-box;padding:8px;font-size:16px;border:1px solid #ccc;border-radius:6px}
+  table{width:100%;border-collapse:collapse;font-size:14px}
+  td,th{border-bottom:1px solid #eee;padding:6px;text-align:left}
+  #msg{font-size:14px;color:#b45309;min-height:20px}
+</style>
+</head>
+<body>
+<h1>發票掃描器</h1>
+
+<div class="card">
+  <video id="video" playsinline muted></video>
+  <canvas id="prev" style="display:none"></canvas>
+  <div>
+    <button id="btnCam">開啟相機(自動掃 QR)</button>
+    <button id="btnShot" class="gray">拍照 OCR(二聯/傳統/手寫)</button>
+    <button id="btnFile" class="gray">上傳照片</button>
+    <input type="file" id="file" accept="image/*" style="display:none">
+  </div>
+  <div id="msg"></div>
+</div>
+
+<div class="card">
+  <label>掃描槍輸入(點這格後用 2D 掃描槍掃發票左側 QR)</label>
+  <input id="scanner" placeholder="掃描槍專用">
+</div>
+
+<div class="card">
+  <label>發票號碼</label><input id="f_no">
+  <label>日期</label><input id="f_date" placeholder="YYYY-MM-DD">
+  <label>賣方統編</label><input id="f_seller" inputmode="numeric">
+  <label>買方統編(二聯式為空)</label><input id="f_buyer" inputmode="numeric">
+  <label>含稅總額</label><input id="f_total" inputmode="numeric">
+  <label>未稅金額</label><input id="f_sales" inputmode="numeric">
+  <div style="margin-top:8px">
+    <button id="btnSave">加入清單</button>
+    <button id="btnCsv" class="gray">匯出 CSV</button>
+  </div>
+</div>
+
+<div class="card">
+  <table><thead><tr><th>號碼</th><th>日期</th><th>賣方</th><th>買方</th><th>總額</th></tr></thead>
+  <tbody id="list"></tbody></table>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jsQR/1.4.0/jsQR.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/tesseract.js/5.1.1/tesseract.min.js"></script>
+<script>
+const $ = id => document.getElementById(id);
+const video = $('video'), prev = $('prev'), msg = $('msg');
+const rows = [];
+let stream = null, scanning = false;
+
+/* ---------- 電子發票 QR 解析 ----------
+ 左側 QR 前 77 碼:
+ 0-9 發票號碼 | 10-16 民國日期 | 17-20 隨機碼 | 21-28 未稅(16進位)
+ 29-36 含稅(16進位) | 37-44 買方統編 | 45-52 賣方統編 | 53-76 加密驗證 */
+function parseEInvoice(t) {
+  if (t.length < 77 || !/^[A-Z]{2}\d{8}\d{7}/.test(t)) return null;
+  const roc = +t.slice(10, 13) + 1911, m = t.slice(13, 15), d = t.slice(15, 17);
+  const buyer = t.slice(37, 45);
+  return {
+    no: t.slice(0, 10),
+    date: `${roc}-${m}-${d}`,
+    sales: parseInt(t.slice(21, 29), 16),
+    total: parseInt(t.slice(29, 37), 16),
+    buyer: buyer === '00000000' ? '' : buyer,
+    seller: t.slice(45, 53)
+  };
+}
+
+function fill(r) {
+  $('f_no').value = r.no || '';
+  $('f_date').value = r.date || '';
+  $('f_seller').value = r.seller || '';
+  $('f_buyer').value = r.buyer || '';
+  $('f_total').value = r.total ?? '';
+  $('f_sales').value = r.sales ?? '';
+}
+
+/* ---------- 相機 + QR 連續掃描 ---------- */
+$('btnCam').onclick = async () => {
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } });
+  } catch (e) { msg.textContent = '無法開啟相機(需 HTTPS 或 localhost)。可改用「上傳照片」。'; return; }
+  video.style.display = 'block'; prev.style.display = 'none';
+  video.srcObject = stream; await video.play();
+  scanning = true; msg.textContent = '請把發票左側 QR 對準鏡頭…';
+  loop();
+};
+function loop() {
+  if (!scanning) return;
+  if (video.readyState === video.HAVE_ENOUGH_DATA) {
+    const c = document.createElement('canvas');
+    c.width = video.videoWidth; c.height = video.videoHeight;
+    const x = c.getContext('2d'); x.drawImage(video, 0, 0);
+    const img = x.getImageData(0, 0, c.width, c.height);
+    const code = jsQR(img.data, img.width, img.height, { inversionAttempts: 'attemptBoth' });
+    if (code) {
+      const r = parseEInvoice(code.data);
+      if (r) { fill(r); msg.textContent = '✅ QR 掃描成功,請確認後加入清單'; if (navigator.vibrate) navigator.vibrate(100); stopCam(); return; }
+    }
+  }
+  requestAnimationFrame(loop);
+}
+function stopCam() { scanning = false; if (stream) stream.getTracks().forEach(t => t.stop()); }
+
+/* ---------- OCR(二聯式 / 傳統 / 手寫) ---------- */
+async function ocrCanvas(canvas) {
+  msg.textContent = 'OCR 辨識中(第一次需下載語言檔,請稍候)…';
+  const { data } = await Tesseract.recognize(canvas, 'chi_tra+eng');
+  const text = data.text.replace(/[ \t]/g, '');
+  const out = {};
+  // 統編:「統一編號/統編」後面的 8 碼數字
+  const ids = [...text.matchAll(/(?:統一?編號|統編)[::]?(\d{8})/g)].map(m => m[1]);
+  if (ids.length) { out.seller = ids[0]; if (ids[1]) out.buyer = ids[1]; }
+  else { const any = text.match(/\b\d{8}\b/); if (any) out.seller = any[0]; }
+  // 金額:優先找「總計/合計/總額」後面的數字
+  const amt = text.match(/(?:總計|合計|總額|應收|金額)[::NT\$]*([\d,]{2,})/);
+  if (amt) out.total = +amt[1].replace(/,/g, '');
+  // 發票號碼(傳統:2 英文 + 8 數字)
+  const no = text.match(/[A-Z]{2}[-]?\d{8}/); if (no) out.no = no[0].replace('-', '');
+  // 日期(民國 xxx年xx月xx日 或 西元)
+  const d = text.match(/(\d{2,4})[年\/\-.](\d{1,2})[月\/\-.](\d{1,2})/);
+  if (d) { let y = +d[1]; if (y < 1911) y += 1911; out.date = `${y}-${d[2].padStart(2,'0')}-${d[3].padStart(2,'0')}`; }
+  fill(out);
+  msg.textContent = '⚠️ OCR 結果可能有誤(尤其手寫),請逐欄核對。';
+  console.log(data.text);
+}
+$('btnShot').onclick = async () => {
+  if (!stream || !video.videoWidth) { msg.textContent = '請先開啟相機,或用「上傳照片」。'; return; }
+  scanning = false;
+  const c = document.createElement('canvas');
+  c.width = video.videoWidth; c.height = video.videoHeight;
+  c.getContext('2d').drawImage(video, 0, 0);
+  stopCam(); await ocrCanvas(c);
+};
+$('btnFile').onclick = () => $('file').click();
+$('file').onchange = async e => {
+  const f = e.target.files[0]; if (!f) return;
+  const img = new Image(); img.src = URL.createObjectURL(f); await img.decode();
+  const c = document.createElement('canvas'); c.width = img.width; c.height = img.height;
+  const x = c.getContext('2d'); x.drawImage(img, 0, 0);
+  // 先試 QR,失敗再 OCR
+  const d = x.getImageData(0, 0, c.width, c.height);
+  const code = jsQR(d.data, d.width, d.height, { inversionAttempts: 'attemptBoth' });
+  const r = code && parseEInvoice(code.data);
+  if (r) { fill(r); msg.textContent = '✅ 照片內 QR 掃描成功'; }
+  else await ocrCanvas(c);
+};
+
+/* ---------- 掃描槍(鍵盤模式) ---------- */
+$('scanner').addEventListener('keydown', e => {
+  if (e.key !== 'Enter') return;
+  const r = parseEInvoice(e.target.value.trim());
+  if (r) { fill(r); msg.textContent = '✅ 掃描槍讀取成功'; }
+  else msg.textContent = '格式不符,請掃發票左側的 QR';
+  e.target.value = '';
+});
+
+/* ---------- 加入主畫面用的 manifest ---------- */
+(() => {
+  const icon = 'data:image/svg+xml,' + encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><rect width="100" height="100" fill="#2563eb"/><text x="50" y="68" font-size="60" text-anchor="middle">🧾</text></svg>');
+  const m = { name: '發票掃描器', short_name: '發票', start_url: '.', display: 'standalone',
+              background_color: '#f6f7f9', theme_color: '#2563eb',
+              icons: [{ src: icon, sizes: '192x192 512x512', type: 'image/svg+xml' }] };
+  const l = document.createElement('link'); l.rel = 'manifest';
+  l.href = URL.createObjectURL(new Blob([JSON.stringify(m)], { type: 'application/manifest+json' }));
+  document.head.appendChild(l);
+})();
+
+/* ---------- 清單與 CSV ---------- */
+$('btnSave').onclick = () => {
+  const r = { no: $('f_no').value, date: $('f_date').value, seller: $('f_seller').value,
+              buyer: $('f_buyer').value, total: $('f_total').value, sales: $('f_sales').value };
+  rows.push(r);
+  const tr = document.createElement('tr');
+  [r.no, r.date, r.seller, r.buyer, r.total].forEach(v => { const td = document.createElement('td'); td.textContent = v; tr.appendChild(td); });
+  $('list').appendChild(tr);
+};
+$('btnCsv').onclick = () => {
+  const head = '發票號碼,日期,賣方統編,買方統編,含稅總額,未稅金額\n';
+  const body = rows.map(r => [r.no, r.date, r.seller, r.buyer, r.total, r.sales].join(',')).join('\n');
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob(['\ufeff' + head + body], { type: 'text/csv' }));
+  a.download = 'invoices.csv'; a.click();
+};
+</script>
+</body>
+</html>
