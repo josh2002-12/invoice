@@ -2,23 +2,22 @@
 <html lang="zh-Hant">
 <head>
 <meta charset="utf-8">
-<meta name="theme-color" content="#2563eb">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#2563eb">
 <title>發票掃描器</title>
 <style>
   body{font-family:system-ui,"Noto Sans TC",sans-serif;max-width:720px;margin:0 auto;padding:16px;background:#f6f7f9;color:#222}
   h1{font-size:20px}
   .card{background:#fff;border-radius:12px;padding:14px;margin-bottom:14px;box-shadow:0 1px 3px #0002}
-  video,canvas#prev{width:100%;border-radius:8px;background:#000}
+  video{width:100%;border-radius:8px;background:#000;display:none}
   button{padding:10px 14px;border:0;border-radius:8px;background:#2563eb;color:#fff;font-size:15px;margin:4px 4px 4px 0}
-  button.gray{background:#64748b}
+  button.gray{background:#64748b} button.green{background:#16a34a}
+  button:disabled{opacity:.5}
   label{display:block;margin:8px 0 2px;font-size:13px;color:#555}
   input{width:100%;box-sizing:border-box;padding:8px;font-size:16px;border:1px solid #ccc;border-radius:6px}
   table{width:100%;border-collapse:collapse;font-size:14px}
   td,th{border-bottom:1px solid #eee;padding:6px;text-align:left}
-    .chip{display:inline-block;padding:7px 12px;margin:3px;background:#e0e7ff;border-radius:16px;font-size:15px;cursor:pointer}
-  pre#raw{white-space:pre-wrap;word-break:break-all;font-size:12px;background:#f1f5f9;padding:8px;border-radius:6px}
-  #msg{font-size:14px;color:#b45309;min-height:20px}
+  #msg{font-size:14px;color:#b45309;min-height:20px;margin-top:6px}
 </style>
 </head>
 <body>
@@ -26,11 +25,10 @@
 
 <div class="card">
   <video id="video" playsinline muted></video>
-  <canvas id="prev" style="display:none"></canvas>
   <div>
-    <button id="btnCam">開啟相機(自動掃 QR)</button>
+    <button id="btnCam">開啟相機</button>
+    <button id="btnShot" class="green">📷 掃描文字</button>
     <button id="btnStop" class="gray">關閉相機</button>
-    <button id="btnShot" class="gray">拍照 OCR(二聯/傳統/手寫)</button>
     <button id="btnFile" class="gray">上傳照片</button>
     <input type="file" id="file" accept="image/*" style="display:none">
   </div>
@@ -38,33 +36,16 @@
 </div>
 
 <div class="card">
-  <label>掃描槍輸入(點這格後用 2D 掃描槍掃發票左側 QR)</label>
-  <input id="scanner" placeholder="掃描槍專用">
-</div>
-
-<div class="card">
   <label>發票號碼</label><input id="f_no">
   <label>日期</label><input id="f_date" placeholder="YYYY-MM-DD">
   <label>賣方統編</label><input id="f_seller" inputmode="numeric">
-  <label>買方統編(二聯式為空)</label><input id="f_buyer" inputmode="numeric">
+  <label>買方統編(沒有就留空)</label><input id="f_buyer" inputmode="numeric">
   <label>含稅總額</label><input id="f_total" inputmode="numeric">
   <label>未稅金額</label><input id="f_sales" inputmode="numeric">
   <div style="margin-top:8px">
     <button id="btnSave">加入清單</button>
-    <button id="btnCsv" class="gray">匯出 Excel</button>
+    <button id="btnXlsx" class="gray">匯出 Excel</button>
   </div>
-</div>
-
-<div class="card">
-  <div style="font-size:13px;color:#555">OCR 候選數字:先點上面要填的欄位,再點下面的數字帶入</div>
-  <div id="chips"></div>
-  <details style="margin-top:8px"><summary style="font-size:13px;color:#555">查看原始辨識內容(除錯用)</summary><pre id="raw"></pre></details>
-</div>
-
-<div class="card">
-  <label>Google 試算表連結(貼上 Apps Script 網頁應用程式網址,只會存在這台裝置)</label>
-  <input id="sheetUrl" placeholder="https://script.google.com/macros/s/.../exec">
-  <button id="btnSheet" class="gray">儲存連結</button>
 </div>
 
 <div class="card">
@@ -72,161 +53,88 @@
   <tbody id="list"></tbody></table>
 </div>
 
-<script src="https://cdnjs.cloudflare.com/ajax/libs/jsQR/1.4.0/jsQR.min.js"></script>
+<div class="card">
+  <label>Apps Script 網址(文字辨識與寫入試算表都用這個,只存在這台裝置)</label>
+  <input id="sheetUrl" placeholder="https://script.google.com/macros/s/.../exec">
+  <button id="btnUrl" class="gray">儲存網址</button>
+</div>
+
 <script src="https://cdnjs.cloudflare.com/ajax/libs/exceljs/4.4.0/exceljs.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/tesseract.js/5.1.1/tesseract.min.js"></script>
 <script>
 const $ = id => document.getElementById(id);
-const video = $('video'), prev = $('prev'), msg = $('msg');
+const video = $('video'), msg = $('msg');
+const FIELDS = ['no', 'date', 'seller', 'buyer', 'total', 'sales'];
 const rows = [];
-let stream = null, scanning = false;
+let stream = null, busy = false;
 
-/* ---------- 電子發票 QR 解析 ----------
- 左側 QR 前 77 碼:
- 0-9 發票號碼 | 10-16 民國日期 | 17-20 隨機碼 | 21-28 未稅(16進位)
- 29-36 含稅(16進位) | 37-44 買方統編 | 45-52 賣方統編 | 53-76 加密驗證 */
-function parseEInvoice(t) {
-  if (t.length < 77 || !/^[A-Z]{2}\d{8}\d{7}/.test(t)) return null;
-  const roc = +t.slice(10, 13) + 1911, m = t.slice(13, 15), d = t.slice(15, 17);
-  const buyer = t.slice(37, 45);
-  return {
-    no: t.slice(0, 10),
-    date: `${roc}-${m}-${d}`,
-    sales: parseInt(t.slice(21, 29), 16),
-    total: parseInt(t.slice(29, 37), 16),
-    buyer: buyer === '00000000' ? '' : buyer,
-    seller: t.slice(45, 53)
-  };
+/* ---------- 欄位檢查:標紅代表可能辨識錯誤 ---------- */
+function validTaxId(id) {                       // 統一編號檢查碼
+  if (!/^\d{8}$/.test(id)) return false;
+  const w = [1, 2, 1, 2, 1, 2, 4, 1]; let sum = 0;
+  for (let i = 0; i < 8; i++) { const p = +id[i] * w[i]; sum += Math.floor(p / 10) + p % 10; }
+  return sum % 10 === 0 || (id[6] === '7' && (sum + 1) % 10 === 0);
 }
+function validDate(v) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(v)) return false;
+  const d = new Date(v + 'T00:00:00'); return !isNaN(d) && d.toISOString().slice(0, 10) === v;
+}
+const rules = {
+  no: v => /^[A-Z]{2}\d{8}$/.test(v), date: validDate, seller: validTaxId, buyer: validTaxId,
+  total: v => /^\d+$/.test(v), sales: v => /^\d+$/.test(v)
+};
+function check() {
+  const bad = [];
+  FIELDS.forEach(k => {
+    const el = $('f_' + k), v = el.value.trim();
+    const wrong = v !== '' && !rules[k](v);
+    el.style.borderColor = wrong ? '#dc2626' : '#ccc';
+    el.style.background = wrong ? '#fef2f2' : '#fff';
+    if (wrong) bad.push(el.previousElementSibling.textContent.replace(/(.*)/, ''));
+  });
+  return bad.length;
+}
+FIELDS.forEach(k => $('f_' + k).addEventListener('input', check));
 
-function fill(r) {
-  $('f_no').value = r.no || '';
-  $('f_date').value = r.date || '';
-  $('f_seller').value = r.seller || '';
-  $('f_buyer').value = r.buyer || '';
-  $('f_total').value = r.total ?? '';
-  $('f_sales').value = r.sales ?? '';
-}
-
-/* ---------- 解碼:優先用瀏覽器內建 BarcodeDetector,沒有就用 jsQR ---------- */
-let detector = null, busy = false;
-try { if ('BarcodeDetector' in window) detector = new BarcodeDetector({ formats: ['qr_code'] }); } catch (e) {}
-
-function jsqrCanvas(canvas) {
-  const out = [];
-  const tryScale = k => {
-    const c = document.createElement('canvas');
-    c.width = Math.round(canvas.width * k); c.height = Math.round(canvas.height * k);
-    const x = c.getContext('2d', { willReadFrequently: true });
-    x.drawImage(canvas, 0, 0, c.width, c.height);
-    const d = x.getImageData(0, 0, c.width, c.height);
-    const code = jsQR(d.data, d.width, d.height, { inversionAttempts: 'attemptBoth' });
-    if (code) out.push(code.data);
-  };
-  const k1 = Math.min(1, 1600 / Math.max(canvas.width, canvas.height));
-  tryScale(k1);
-  if (!out.length) tryScale(k1 * 0.5);
-  return out;
-}
-async function decodeCanvas(canvas) {
-  if (detector) {
-    try { const r = await detector.detect(canvas); if (r.length) return r.map(b => b.rawValue); } catch (e) {}
-  }
-  return jsqrCanvas(canvas);
-}
-function handleTexts(texts) {
-  if (texts.length) $('raw').textContent = 'QR 原始內容:\n' + texts.join('\n');
-  for (const t of texts) {
-    const r = parseEInvoice(t.trim());
-    if (r) { fill(r); msg.textContent = '✅ QR 掃描成功,請確認後加入清單'; return true; }
-  }
-  if (texts.length) {
-    const raw = texts[0];
-    msg.textContent = raw.startsWith('**') ? '這是右側 QR,請改掃發票「左邊」那個' : '掃到 QR,但不是電子發票格式:' + raw.slice(0, 20);
-  }
-  return false;
-}
-
-/* ---------- 相機 + QR 連續掃描 ---------- */
+/* ---------- 相機(掃描文字時不會關閉) ---------- */
 $('btnCam').onclick = async () => {
-  if (stream && scanning) return;
+  if (stream) return;
   try {
     stream = await navigator.mediaDevices.getUserMedia({ video: {
       facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1080 },
       advanced: [{ focusMode: 'continuous' }] } });
   } catch (e) {
     try { stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } }); }
-    catch (e2) { msg.textContent = '無法開啟相機(需 HTTPS 並允許相機權限)。可改用「上傳照片」。'; return; }
+    catch (e2) { msg.textContent = '無法開啟相機(需允許相機權限)。可改用「上傳照片」。'; return; }
   }
-  video.style.display = 'block'; prev.style.display = 'none';
-  video.srcObject = stream; await video.play();
-  scanning = true;
-  msg.textContent = '請把發票左側 QR 對準鏡頭,距離約 15–20 公分、保持不動、避開反光…';
-  loop();
+  video.srcObject = stream; video.style.display = 'block'; await video.play();
+  msg.textContent = '把發票放平、對準鏡頭、文字清楚後,按「📷 掃描文字」';
 };
-let ocrBusy = false, lastKey = '', emptyCount = 0;
-async function loop() {
-  if (!scanning) return;
-  if (video.readyState === video.HAVE_ENOUGH_DATA && !busy && !ocrBusy) {
-    busy = true;
-    const c = document.createElement('canvas');
-    c.width = video.videoWidth; c.height = video.videoHeight;
-    c.getContext('2d', { willReadFrequently: true }).drawImage(video, 0, 0);
-    const texts = await decodeCanvas(c);
-    busy = false;
-    if (!texts.length) { if (++emptyCount > 15) lastKey = ''; }   // QR 離開畫面一陣子後,才允許重掃同一張
-    else {
-      emptyCount = 0;
-      const key = texts.join('|');
-      if (key !== lastKey) {                                       // 同一個 QR 不重複處理
-        lastKey = key;
-        if (handleTexts(texts) && navigator.vibrate) navigator.vibrate(100);
-      }
-    }
-  }
-  setTimeout(loop, 80);
-}
-function stopCam() {
-  scanning = false;
+$('btnStop').onclick = () => {
   if (stream) stream.getTracks().forEach(t => t.stop());
-  stream = null; video.srcObject = null; video.style.display = 'none';
-}
-$('btnStop').onclick = () => { stopCam(); msg.textContent = '相機已關閉'; };
-
-
-/* ---------- OCR(二聯式 / 傳統 / 手寫) ---------- */
-/* 影像前處理:放大、灰階、拉開對比、Otsu 二值化,提高熱感紙數字的辨識率 */
-function preprocess(src) {
-  const k = 1800 / src.width;
+  stream = null; video.srcObject = null; video.style.display = 'none'; msg.textContent = '相機已關閉';
+};
+$('btnShot').onclick = () => {
+  if (!stream || !video.videoWidth) { msg.textContent = '請先按「開啟相機」,或用「上傳照片」'; return; }
   const c = document.createElement('canvas');
-  c.width = Math.round(src.width * k); c.height = Math.round(src.height * k);
-  const x = c.getContext('2d', { willReadFrequently: true });
-  x.drawImage(src, 0, 0, c.width, c.height);
-  const img = x.getImageData(0, 0, c.width, c.height), d = img.data;
-  const g = new Uint8Array(c.width * c.height), hist = new Array(256).fill(0);
-  for (let i = 0, j = 0; i < d.length; i += 4, j++) { g[j] = (d[i] * 0.299 + d[i+1] * 0.587 + d[i+2] * 0.114) | 0; hist[g[j]]++; }
-  const total = g.length; let acc = 0, lo = 0, hi = 255;
-  for (let v = 0; v < 256; v++) { acc += hist[v]; if (acc > total * 0.02) { lo = v; break; } }
-  acc = 0; for (let v = 255; v >= 0; v--) { acc += hist[v]; if (acc > total * 0.02) { hi = v; break; } }
-  const span = Math.max(1, hi - lo), h2 = new Array(256).fill(0);
-  for (let j = 0; j < g.length; j++) { g[j] = Math.max(0, Math.min(255, ((g[j] - lo) * 255 / span) | 0)); h2[g[j]]++; }
-  let sum = 0; for (let v = 0; v < 256; v++) sum += v * h2[v];
-  let wB = 0, sB = 0, best = 0, th = 128;
-  for (let v = 0; v < 256; v++) {
-    wB += h2[v]; if (!wB) continue; const wF = total - wB; if (!wF) break;
-    sB += v * h2[v]; const mB = sB / wB, mF = (sum - sB) / wF, between = wB * wF * (mB - mF) ** 2;
-    if (between > best) { best = between; th = v; }
-  }
-  for (let i = 0, j = 0; i < d.length; i += 4, j++) { const b = g[j] > th ? 255 : 0; d[i] = d[i+1] = d[i+2] = b; }
-  x.putImageData(img, 0, 0);
-  return c;
-}
+  c.width = video.videoWidth; c.height = video.videoHeight;
+  c.getContext('2d').drawImage(video, 0, 0);
+  readText(c);
+};
+$('btnFile').onclick = () => $('file').click();
+$('file').onchange = async e => {
+  const f = e.target.files[0]; if (!f) return;
+  const img = new Image(); img.src = URL.createObjectURL(f); await img.decode();
+  const c = document.createElement('canvas'); c.width = img.width; c.height = img.height;
+  c.getContext('2d').drawImage(img, 0, 0);
+  e.target.value = ''; readText(c);
+};
 
-/* ---------- AI 視覺辨識(透過你自己的 Apps Script,金鑰不會放在網頁) ---------- */
-async function aiOcr(canvas) {
+/* ---------- 文字辨識(AI 視覺,透過你自己的 Apps Script) ---------- */
+async function readText(canvas) {
   const url = $('sheetUrl').value.trim();
-  if (!url) return false;
-  msg.textContent = '🤖 AI 辨識中,請稍候…';
+  if (!url) { msg.textContent = '請先在最下方貼上 Apps Script 網址並儲存'; return; }
+  if (busy) return;
+  busy = true; $('btnShot').disabled = true; msg.textContent = '🤖 辨識文字中,請稍候…';
   try {
     const k = Math.min(1, 1280 / Math.max(canvas.width, canvas.height));
     const c = document.createElement('canvas');
@@ -236,149 +144,58 @@ async function aiOcr(canvas) {
     const res = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'text/plain;charset=utf-8' },
       body: JSON.stringify({ action: 'ocr', image: b64 }) });
     const r = await res.json();
-    $('raw').textContent = 'AI 回傳:\n' + JSON.stringify(r, null, 2);
-    if (r.error) { msg.textContent = '⚠️ AI 辨識失敗,改用本機 OCR:' + String(r.error).slice(0, 80); return false; }
-    fill({ no: r.no || '', date: r.date || '', seller: r.seller || '', buyer: r.buyer || '', total: r.total ?? '', sales: r.sales ?? '' });
-    msg.textContent = '🤖 AI 辨識完成,請務必核對後再加入清單';
-    return true;
+    if (r.error) { msg.textContent = '⚠️ 辨識失敗:' + String(r.error).slice(0, 80); return; }
+    FIELDS.forEach(k2 => { $('f_' + k2).value = r[k2] == null ? '' : String(r[k2]).replace(/[,\s]/g, ''); });
+    const n = check();
+    msg.textContent = n ? `⚠️ 有 ${n} 個欄位(標紅)可能有誤,請對照發票修正` : '✅ 辨識完成,請對照發票核對後按「加入清單」';
   } catch (e) {
-    msg.textContent = '⚠️ 無法連線 AI 辨識,改用本機 OCR';
-    return false;
-  }
+    msg.textContent = '⚠️ 無法連線辨識服務,請確認網址與網路';
+  } finally { busy = false; $('btnShot').disabled = false; }
 }
 
-async function ocrCanvas(canvas) {
-  if (await aiOcr(canvas)) return;
-  msg.textContent = 'OCR 辨識中(第一次需下載語言檔,請稍候)…';
-  const pre = preprocess(canvas);
-  // 第一輪:中英文,抓「統一編號 / 總計」等文字標籤
-  const w1 = await Tesseract.createWorker('chi_tra+eng');
-  await w1.setParameters({ tessedit_pageseg_mode: '6' });
-  const t1 = (await w1.recognize(pre)).data.text; await w1.terminate();
-  // 第二輪:只認數字與英文字母,數字比較不會被認成中文字
-  const w2 = await Tesseract.createWorker('eng');
-  await w2.setParameters({ tessedit_pageseg_mode: '6', tessedit_char_whitelist: '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ-:/$,. ' });
-  const t2 = (await w2.recognize(pre)).data.text; await w2.terminate();
-
-  $('raw').textContent = '【中英文辨識】\n' + t1 + '\n\n【數字辨識】\n' + t2;
-  const text = (t1 + '\n' + t2).replace(/[ \t]/g, '');
-  const out = {};
-  const ids = [...text.matchAll(/(?:統一?編號|統編)[::]?(\d{8})/g)].map(m => m[1]);
-  if (ids.length) { out.seller = ids[0]; if (ids[1]) out.buyer = ids[1]; }
-  const amt = text.match(/(?:總計|合計|總額|應收|金額)[::NT\$]*([\d,]{2,})/);
-  if (amt) out.total = +amt[1].replace(/,/g, '');
-  const no = text.match(/[A-Z]{2}[-]?\d{8}/); if (no) out.no = no[0].replace('-', '');
-  const dt = text.match(/(\d{2,4})[年\/\-.](\d{1,2})[月\/\-.](\d{1,2})/);
-  if (dt) { let y = +dt[1]; if (y < 1911) y += 1911; out.date = `${y}-${dt[2].padStart(2,'0')}-${dt[3].padStart(2,'0')}`; }
-  fill(out);
-
-  // 候選數字:8 碼(可能是統編)與其他數字(可能是金額),讓使用者點選帶入
-  const cand = new Set();
-  (text.match(/\d{8}/g) || []).forEach(v => cand.add(v));
-  (text.match(/\d{1,3}(?:,\d{3})+|\d{2,7}/g) || []).forEach(v => cand.add(v.replace(/,/g, '')));
-  $('chips').innerHTML = '';
-  [...cand].slice(0, 30).forEach(v => {
-    const b = document.createElement('span'); b.className = 'chip'; b.textContent = v;
-    b.onclick = () => { if (lastInput) { lastInput.value = v; } else msg.textContent = '請先點上方要填的欄位,再點數字'; };
-    $('chips').appendChild(b);
-  });
-  msg.textContent = '⚠️ OCR 結果僅供參考,請核對;不對的欄位可點選欄位後,再點下方候選數字帶入。';
-}
-let lastInput = null;
-document.querySelectorAll('input[id^="f_"]').forEach(i => i.addEventListener('focus', () => { lastInput = i; }));
-$('btnShot').onclick = async () => {
-  if (!stream || !video.videoWidth) { msg.textContent = '請先開啟相機,或用「上傳照片」。'; return; }
-  const c = document.createElement('canvas');
-  c.width = video.videoWidth; c.height = video.videoHeight;
-  c.getContext('2d').drawImage(video, 0, 0);
-  ocrBusy = true;                       // 辨識時暫停 QR 解碼,但相機畫面保持開啟
-  try { await ocrCanvas(c); } finally { ocrBusy = false; }
-};
-$('btnFile').onclick = () => $('file').click();
-$('file').onchange = async e => {
-  const f = e.target.files[0]; if (!f) return;
-  const img = new Image(); img.src = URL.createObjectURL(f); await img.decode();
-  const c = document.createElement('canvas'); c.width = img.width; c.height = img.height;
-  c.getContext('2d').drawImage(img, 0, 0);
-  msg.textContent = '辨識 QR 中…';
-  const texts = await decodeCanvas(c);
-  if (handleTexts(texts)) return;
-  if (!texts.length) await ocrCanvas(c);   // 找不到 QR 才改用 OCR
-};
-
-/* ---------- 掃描槍(鍵盤模式) ---------- */
-$('scanner').addEventListener('keydown', e => {
-  if (e.key !== 'Enter') return;
-  const r = parseEInvoice(e.target.value.trim());
-  if (r) { fill(r); msg.textContent = '✅ 掃描槍讀取成功'; }
-  else msg.textContent = '格式不符,請掃發票左側的 QR';
-  e.target.value = '';
-});
-
-/* ---------- 加入主畫面用的 manifest ---------- */
-(() => {
-  const icon = 'data:image/svg+xml,' + encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><rect width="100" height="100" fill="#2563eb"/><text x="50" y="68" font-size="60" text-anchor="middle">🧾</text></svg>');
-  const m = { name: '發票掃描器', short_name: '發票', start_url: '.', display: 'standalone',
-              background_color: '#f6f7f9', theme_color: '#2563eb',
-              icons: [{ src: icon, sizes: '192x192 512x512', type: 'image/svg+xml' }] };
-  const l = document.createElement('link'); l.rel = 'manifest';
-  l.href = URL.createObjectURL(new Blob([JSON.stringify(m)], { type: 'application/manifest+json' }));
-  document.head.appendChild(l);
-})();
-
-/* ---------- 清單與 CSV ---------- */
-/* ---------- 傳到 Google 試算表 ---------- */
-try { $('sheetUrl').value = localStorage.getItem('sheetUrl') || ''; } catch (e) {}
-$('btnSheet').onclick = () => {
-  try { localStorage.setItem('sheetUrl', $('sheetUrl').value.trim()); msg.textContent = '✅ 已儲存試算表連結'; }
-  catch (e) { msg.textContent = '無法儲存連結(瀏覽器禁止儲存)'; }
-};
-async function sendToSheet(r) {
-  const url = $('sheetUrl').value.trim();
-  if (!url) return false;
-  try {
-    await fetch(url, { method: 'POST', mode: 'no-cors',
-      headers: { 'Content-Type': 'text/plain;charset=utf-8' }, body: JSON.stringify(r) });
-    return true;
-  } catch (e) { return false; }
-}
-
+/* ---------- 加入清單 → 寫入試算表 ---------- */
 $('btnSave').onclick = async () => {
-  const r = { no: $('f_no').value, date: $('f_date').value, seller: $('f_seller').value,
-              buyer: $('f_buyer').value, total: $('f_total').value, sales: $('f_sales').value };
+  const r = {}; FIELDS.forEach(k => r[k] = $('f_' + k).value.trim());
+  if (!r.no && !r.total) { msg.textContent = '請先掃描或輸入發票資料'; return; }
   rows.push(r);
   const tr = document.createElement('tr');
   [r.no, r.date, r.seller, r.buyer, r.total].forEach(v => { const td = document.createElement('td'); td.textContent = v; tr.appendChild(td); });
   $('list').appendChild(tr);
-  if ($('sheetUrl').value.trim()) {
-    msg.textContent = '傳送到試算表中…';
-    const ok = await sendToSheet(r);
-    msg.textContent = ok ? '✅ 已加入清單並送出到試算表' : '⚠️ 已加入清單,但傳送試算表失敗(請檢查網路與連結)';
-  }
+  FIELDS.forEach(k => $('f_' + k).value = ''); check();
+  const url = $('sheetUrl').value.trim();
+  if (!url) { msg.textContent = '已加入清單(尚未設定試算表網址,未寫入試算表)'; return; }
+  msg.textContent = '寫入試算表中…';
+  try {
+    const res = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'text/plain;charset=utf-8' }, body: JSON.stringify(r) });
+    const t = (await res.text()).trim();
+    msg.textContent = t === 'ok' ? '✅ 已寫入試算表' : t === 'dup' ? '⚠️ 試算表已有相同發票號碼,未重複寫入' : '⚠️ 試算表回應:' + t.slice(0, 60);
+  } catch (e) { msg.textContent = '⚠️ 已送出,但無法確認結果,請到試算表檢查'; }
 };
-$('btnCsv').onclick = async () => {
-  if (!rows.length) { msg.textContent = '清單是空的,請先加入發票'; return; }
-  const wb = new ExcelJS.Workbook();
-  const ws = wb.addWorksheet('發票');
+
+/* ---------- 匯出 Excel(欄寬、靠左、統編保留 0) ---------- */
+$('btnXlsx').onclick = async () => {
+  if (!rows.length) { msg.textContent = '清單是空的'; return; }
+  const wb = new ExcelJS.Workbook(), ws = wb.addWorksheet('發票');
   ws.columns = [
-    { header: '發票號碼', key: 'no',     width: 16 },
-    { header: '日期',     key: 'date',   width: 14 },
-    { header: '賣方統編', key: 'seller', width: 14 },
-    { header: '買方統編', key: 'buyer',  width: 14 },
-    { header: '含稅總額', key: 'total',  width: 12 },
-    { header: '未稅金額', key: 'sales',  width: 12 }
-  ];
-  const num = v => (v === '' || v == null || isNaN(v)) ? '' : Number(v);
-  rows.forEach(r => ws.addRow({ no: r.no, date: r.date, seller: r.seller, buyer: r.buyer, total: num(r.total), sales: num(r.sales) }));
-  ws.getColumn('seller').numFmt = '@';   // 統編當文字,保留開頭的 0
-  ws.getColumn('buyer').numFmt = '@';
+    { header: '發票號碼', key: 'no', width: 16 }, { header: '日期', key: 'date', width: 14 },
+    { header: '賣方統編', key: 'seller', width: 14 }, { header: '買方統編', key: 'buyer', width: 14 },
+    { header: '含稅總額', key: 'total', width: 12 }, { header: '未稅金額', key: 'sales', width: 12 }];
+  const num = v => (v === '' || isNaN(v)) ? '' : Number(v);
+  rows.forEach(r => ws.addRow({ ...r, total: num(r.total), sales: num(r.sales) }));
+  ws.getColumn('seller').numFmt = '@'; ws.getColumn('buyer').numFmt = '@';
   ws.eachRow(row => row.eachCell(c => { c.alignment = { horizontal: 'left', vertical: 'middle' }; }));
-  ws.getRow(1).font = { bold: true };
-  ws.views = [{ state: 'frozen', ySplit: 1 }];
+  ws.getRow(1).font = { bold: true }; ws.views = [{ state: 'frozen', ySplit: 1 }];
   const buf = await wb.xlsx.writeBuffer();
   const a = document.createElement('a');
   a.href = URL.createObjectURL(new Blob([buf], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }));
   a.download = 'invoices.xlsx'; a.click();
+};
+
+/* ---------- 網址設定 ---------- */
+try { $('sheetUrl').value = localStorage.getItem('sheetUrl') || ''; } catch (e) {}
+$('btnUrl').onclick = () => {
+  try { localStorage.setItem('sheetUrl', $('sheetUrl').value.trim()); msg.textContent = '✅ 已儲存網址'; }
+  catch (e) { msg.textContent = '無法儲存(瀏覽器禁止儲存)'; }
 };
 </script>
 </body>
