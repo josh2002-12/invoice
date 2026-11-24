@@ -27,6 +27,7 @@
   <canvas id="prev" style="display:none"></canvas>
   <div>
     <button id="btnCam">開啟相機(自動掃 QR)</button>
+    <button id="btnStop" class="gray">關閉相機</button>
     <button id="btnShot" class="gray">拍照 OCR(二聯/傳統/手寫)</button>
     <button id="btnFile" class="gray">上傳照片</button>
     <input type="file" id="file" accept="image/*" style="display:none">
@@ -139,6 +140,7 @@ function handleTexts(texts) {
 
 /* ---------- 相機 + QR 連續掃描 ---------- */
 $('btnCam').onclick = async () => {
+  if (stream && scanning) return;
   try {
     stream = await navigator.mediaDevices.getUserMedia({ video: {
       facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1080 },
@@ -153,20 +155,35 @@ $('btnCam').onclick = async () => {
   msg.textContent = '請把發票左側 QR 對準鏡頭,距離約 15–20 公分、保持不動、避開反光…';
   loop();
 };
+let ocrBusy = false, lastKey = '', emptyCount = 0;
 async function loop() {
   if (!scanning) return;
-  if (video.readyState === video.HAVE_ENOUGH_DATA && !busy) {
+  if (video.readyState === video.HAVE_ENOUGH_DATA && !busy && !ocrBusy) {
     busy = true;
     const c = document.createElement('canvas');
     c.width = video.videoWidth; c.height = video.videoHeight;
     c.getContext('2d', { willReadFrequently: true }).drawImage(video, 0, 0);
     const texts = await decodeCanvas(c);
     busy = false;
-    if (handleTexts(texts)) { if (navigator.vibrate) navigator.vibrate(100); stopCam(); return; }
+    if (!texts.length) { if (++emptyCount > 15) lastKey = ''; }   // QR 離開畫面一陣子後,才允許重掃同一張
+    else {
+      emptyCount = 0;
+      const key = texts.join('|');
+      if (key !== lastKey) {                                       // 同一個 QR 不重複處理
+        lastKey = key;
+        if (handleTexts(texts) && navigator.vibrate) navigator.vibrate(100);
+      }
+    }
   }
   setTimeout(loop, 80);
 }
-function stopCam() { scanning = false; if (stream) stream.getTracks().forEach(t => t.stop()); }
+function stopCam() {
+  scanning = false;
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  stream = null; video.srcObject = null; video.style.display = 'none';
+}
+$('btnStop').onclick = () => { stopCam(); msg.textContent = '相機已關閉'; };
+
 
 /* ---------- OCR(二聯式 / 傳統 / 手寫) ---------- */
 async function ocrCanvas(canvas) {
@@ -192,11 +209,11 @@ async function ocrCanvas(canvas) {
 }
 $('btnShot').onclick = async () => {
   if (!stream || !video.videoWidth) { msg.textContent = '請先開啟相機,或用「上傳照片」。'; return; }
-  scanning = false;
   const c = document.createElement('canvas');
   c.width = video.videoWidth; c.height = video.videoHeight;
   c.getContext('2d').drawImage(video, 0, 0);
-  stopCam(); await ocrCanvas(c);
+  ocrBusy = true;                       // 辨識時暫停 QR 解碼,但相機畫面保持開啟
+  try { await ocrCanvas(c); } finally { ocrBusy = false; }
 };
 $('btnFile').onclick = () => $('file').click();
 $('file').onchange = async e => {
