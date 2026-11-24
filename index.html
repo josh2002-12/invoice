@@ -48,8 +48,14 @@
   <label>未稅金額</label><input id="f_sales" inputmode="numeric">
   <div style="margin-top:8px">
     <button id="btnSave">加入清單</button>
-    <button id="btnCsv" class="gray">匯出 CSV</button>
+    <button id="btnCsv" class="gray">匯出 Excel</button>
   </div>
+</div>
+
+<div class="card">
+  <label>Google 試算表連結(貼上 Apps Script 網頁應用程式網址,只會存在這台裝置)</label>
+  <input id="sheetUrl" placeholder="https://script.google.com/macros/s/.../exec">
+  <button id="btnSheet" class="gray">儲存連結</button>
 </div>
 
 <div class="card">
@@ -58,6 +64,7 @@
 </div>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jsQR/1.4.0/jsQR.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/exceljs/4.4.0/exceljs.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/tesseract.js/5.1.1/tesseract.min.js"></script>
 <script>
 const $ = id => document.getElementById(id);
@@ -92,30 +99,72 @@ function fill(r) {
   $('f_sales').value = r.sales ?? '';
 }
 
+/* ---------- 解碼:優先用瀏覽器內建 BarcodeDetector,沒有就用 jsQR ---------- */
+let detector = null, busy = false;
+try { if ('BarcodeDetector' in window) detector = new BarcodeDetector({ formats: ['qr_code'] }); } catch (e) {}
+
+function jsqrCanvas(canvas) {
+  const out = [];
+  const tryScale = k => {
+    const c = document.createElement('canvas');
+    c.width = Math.round(canvas.width * k); c.height = Math.round(canvas.height * k);
+    const x = c.getContext('2d', { willReadFrequently: true });
+    x.drawImage(canvas, 0, 0, c.width, c.height);
+    const d = x.getImageData(0, 0, c.width, c.height);
+    const code = jsQR(d.data, d.width, d.height, { inversionAttempts: 'attemptBoth' });
+    if (code) out.push(code.data);
+  };
+  const k1 = Math.min(1, 1600 / Math.max(canvas.width, canvas.height));
+  tryScale(k1);
+  if (!out.length) tryScale(k1 * 0.5);
+  return out;
+}
+async function decodeCanvas(canvas) {
+  if (detector) {
+    try { const r = await detector.detect(canvas); if (r.length) return r.map(b => b.rawValue); } catch (e) {}
+  }
+  return jsqrCanvas(canvas);
+}
+function handleTexts(texts) {
+  for (const t of texts) {
+    const r = parseEInvoice(t.trim());
+    if (r) { fill(r); msg.textContent = '✅ QR 掃描成功,請確認後加入清單'; return true; }
+  }
+  if (texts.length) {
+    const raw = texts[0];
+    msg.textContent = raw.startsWith('**') ? '這是右側 QR,請改掃發票「左邊」那個' : '掃到 QR,但不是電子發票格式:' + raw.slice(0, 20);
+  }
+  return false;
+}
+
 /* ---------- 相機 + QR 連續掃描 ---------- */
 $('btnCam').onclick = async () => {
   try {
-    stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } });
-  } catch (e) { msg.textContent = '無法開啟相機(需 HTTPS 或 localhost)。可改用「上傳照片」。'; return; }
+    stream = await navigator.mediaDevices.getUserMedia({ video: {
+      facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1080 },
+      advanced: [{ focusMode: 'continuous' }] } });
+  } catch (e) {
+    try { stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } }); }
+    catch (e2) { msg.textContent = '無法開啟相機(需 HTTPS 並允許相機權限)。可改用「上傳照片」。'; return; }
+  }
   video.style.display = 'block'; prev.style.display = 'none';
   video.srcObject = stream; await video.play();
-  scanning = true; msg.textContent = '請把發票左側 QR 對準鏡頭…';
+  scanning = true;
+  msg.textContent = '請把發票左側 QR 對準鏡頭,距離約 15–20 公分、保持不動、避開反光…';
   loop();
 };
-function loop() {
+async function loop() {
   if (!scanning) return;
-  if (video.readyState === video.HAVE_ENOUGH_DATA) {
+  if (video.readyState === video.HAVE_ENOUGH_DATA && !busy) {
+    busy = true;
     const c = document.createElement('canvas');
     c.width = video.videoWidth; c.height = video.videoHeight;
-    const x = c.getContext('2d'); x.drawImage(video, 0, 0);
-    const img = x.getImageData(0, 0, c.width, c.height);
-    const code = jsQR(img.data, img.width, img.height, { inversionAttempts: 'attemptBoth' });
-    if (code) {
-      const r = parseEInvoice(code.data);
-      if (r) { fill(r); msg.textContent = '✅ QR 掃描成功,請確認後加入清單'; if (navigator.vibrate) navigator.vibrate(100); stopCam(); return; }
-    }
+    c.getContext('2d', { willReadFrequently: true }).drawImage(video, 0, 0);
+    const texts = await decodeCanvas(c);
+    busy = false;
+    if (handleTexts(texts)) { if (navigator.vibrate) navigator.vibrate(100); stopCam(); return; }
   }
-  requestAnimationFrame(loop);
+  setTimeout(loop, 80);
 }
 function stopCam() { scanning = false; if (stream) stream.getTracks().forEach(t => t.stop()); }
 
@@ -154,13 +203,11 @@ $('file').onchange = async e => {
   const f = e.target.files[0]; if (!f) return;
   const img = new Image(); img.src = URL.createObjectURL(f); await img.decode();
   const c = document.createElement('canvas'); c.width = img.width; c.height = img.height;
-  const x = c.getContext('2d'); x.drawImage(img, 0, 0);
-  // 先試 QR,失敗再 OCR
-  const d = x.getImageData(0, 0, c.width, c.height);
-  const code = jsQR(d.data, d.width, d.height, { inversionAttempts: 'attemptBoth' });
-  const r = code && parseEInvoice(code.data);
-  if (r) { fill(r); msg.textContent = '✅ 照片內 QR 掃描成功'; }
-  else await ocrCanvas(c);
+  c.getContext('2d').drawImage(img, 0, 0);
+  msg.textContent = '辨識 QR 中…';
+  const texts = await decodeCanvas(c);
+  if (handleTexts(texts)) return;
+  if (!texts.length) await ocrCanvas(c);   // 找不到 QR 才改用 OCR
 };
 
 /* ---------- 掃描槍(鍵盤模式) ---------- */
@@ -184,20 +231,58 @@ $('scanner').addEventListener('keydown', e => {
 })();
 
 /* ---------- 清單與 CSV ---------- */
-$('btnSave').onclick = () => {
+/* ---------- 傳到 Google 試算表 ---------- */
+try { $('sheetUrl').value = localStorage.getItem('sheetUrl') || ''; } catch (e) {}
+$('btnSheet').onclick = () => {
+  try { localStorage.setItem('sheetUrl', $('sheetUrl').value.trim()); msg.textContent = '✅ 已儲存試算表連結'; }
+  catch (e) { msg.textContent = '無法儲存連結(瀏覽器禁止儲存)'; }
+};
+async function sendToSheet(r) {
+  const url = $('sheetUrl').value.trim();
+  if (!url) return false;
+  try {
+    await fetch(url, { method: 'POST', mode: 'no-cors',
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' }, body: JSON.stringify(r) });
+    return true;
+  } catch (e) { return false; }
+}
+
+$('btnSave').onclick = async () => {
   const r = { no: $('f_no').value, date: $('f_date').value, seller: $('f_seller').value,
               buyer: $('f_buyer').value, total: $('f_total').value, sales: $('f_sales').value };
   rows.push(r);
   const tr = document.createElement('tr');
   [r.no, r.date, r.seller, r.buyer, r.total].forEach(v => { const td = document.createElement('td'); td.textContent = v; tr.appendChild(td); });
   $('list').appendChild(tr);
+  if ($('sheetUrl').value.trim()) {
+    msg.textContent = '傳送到試算表中…';
+    const ok = await sendToSheet(r);
+    msg.textContent = ok ? '✅ 已加入清單並送出到試算表' : '⚠️ 已加入清單,但傳送試算表失敗(請檢查網路與連結)';
+  }
 };
-$('btnCsv').onclick = () => {
-  const head = '發票號碼,日期,賣方統編,買方統編,含稅總額,未稅金額\n';
-  const body = rows.map(r => [r.no, r.date, r.seller, r.buyer, r.total, r.sales].join(',')).join('\n');
+$('btnCsv').onclick = async () => {
+  if (!rows.length) { msg.textContent = '清單是空的,請先加入發票'; return; }
+  const wb = new ExcelJS.Workbook();
+  const ws = wb.addWorksheet('發票');
+  ws.columns = [
+    { header: '發票號碼', key: 'no',     width: 16 },
+    { header: '日期',     key: 'date',   width: 14 },
+    { header: '賣方統編', key: 'seller', width: 14 },
+    { header: '買方統編', key: 'buyer',  width: 14 },
+    { header: '含稅總額', key: 'total',  width: 12 },
+    { header: '未稅金額', key: 'sales',  width: 12 }
+  ];
+  const num = v => (v === '' || v == null || isNaN(v)) ? '' : Number(v);
+  rows.forEach(r => ws.addRow({ no: r.no, date: r.date, seller: r.seller, buyer: r.buyer, total: num(r.total), sales: num(r.sales) }));
+  ws.getColumn('seller').numFmt = '@';   // 統編當文字,保留開頭的 0
+  ws.getColumn('buyer').numFmt = '@';
+  ws.eachRow(row => row.eachCell(c => { c.alignment = { horizontal: 'left', vertical: 'middle' }; }));
+  ws.getRow(1).font = { bold: true };
+  ws.views = [{ state: 'frozen', ySplit: 1 }];
+  const buf = await wb.xlsx.writeBuffer();
   const a = document.createElement('a');
-  a.href = URL.createObjectURL(new Blob(['\ufeff' + head + body], { type: 'text/csv' }));
-  a.download = 'invoices.csv'; a.click();
+  a.href = URL.createObjectURL(new Blob([buf], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }));
+  a.download = 'invoices.xlsx'; a.click();
 };
 </script>
 </body>
