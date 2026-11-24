@@ -16,6 +16,8 @@
   input{width:100%;box-sizing:border-box;padding:8px;font-size:16px;border:1px solid #ccc;border-radius:6px}
   table{width:100%;border-collapse:collapse;font-size:14px}
   td,th{border-bottom:1px solid #eee;padding:6px;text-align:left}
+    .chip{display:inline-block;padding:7px 12px;margin:3px;background:#e0e7ff;border-radius:16px;font-size:15px;cursor:pointer}
+  pre#raw{white-space:pre-wrap;word-break:break-all;font-size:12px;background:#f1f5f9;padding:8px;border-radius:6px}
   #msg{font-size:14px;color:#b45309;min-height:20px}
 </style>
 </head>
@@ -51,6 +53,12 @@
     <button id="btnSave">加入清單</button>
     <button id="btnCsv" class="gray">匯出 Excel</button>
   </div>
+</div>
+
+<div class="card">
+  <div style="font-size:13px;color:#555">OCR 候選數字:先點上面要填的欄位,再點下面的數字帶入</div>
+  <div id="chips"></div>
+  <details style="margin-top:8px"><summary style="font-size:13px;color:#555">查看原始辨識內容(除錯用)</summary><pre id="raw"></pre></details>
 </div>
 
 <div class="card">
@@ -127,6 +135,7 @@ async function decodeCanvas(canvas) {
   return jsqrCanvas(canvas);
 }
 function handleTexts(texts) {
+  if (texts.length) $('raw').textContent = 'QR 原始內容:\n' + texts.join('\n');
   for (const t of texts) {
     const r = parseEInvoice(t.trim());
     if (r) { fill(r); msg.textContent = '✅ QR 掃描成功,請確認後加入清單'; return true; }
@@ -186,27 +195,97 @@ $('btnStop').onclick = () => { stopCam(); msg.textContent = '相機已關閉'; }
 
 
 /* ---------- OCR(二聯式 / 傳統 / 手寫) ---------- */
+/* 影像前處理:放大、灰階、拉開對比、Otsu 二值化,提高熱感紙數字的辨識率 */
+function preprocess(src) {
+  const k = 1800 / src.width;
+  const c = document.createElement('canvas');
+  c.width = Math.round(src.width * k); c.height = Math.round(src.height * k);
+  const x = c.getContext('2d', { willReadFrequently: true });
+  x.drawImage(src, 0, 0, c.width, c.height);
+  const img = x.getImageData(0, 0, c.width, c.height), d = img.data;
+  const g = new Uint8Array(c.width * c.height), hist = new Array(256).fill(0);
+  for (let i = 0, j = 0; i < d.length; i += 4, j++) { g[j] = (d[i] * 0.299 + d[i+1] * 0.587 + d[i+2] * 0.114) | 0; hist[g[j]]++; }
+  const total = g.length; let acc = 0, lo = 0, hi = 255;
+  for (let v = 0; v < 256; v++) { acc += hist[v]; if (acc > total * 0.02) { lo = v; break; } }
+  acc = 0; for (let v = 255; v >= 0; v--) { acc += hist[v]; if (acc > total * 0.02) { hi = v; break; } }
+  const span = Math.max(1, hi - lo), h2 = new Array(256).fill(0);
+  for (let j = 0; j < g.length; j++) { g[j] = Math.max(0, Math.min(255, ((g[j] - lo) * 255 / span) | 0)); h2[g[j]]++; }
+  let sum = 0; for (let v = 0; v < 256; v++) sum += v * h2[v];
+  let wB = 0, sB = 0, best = 0, th = 128;
+  for (let v = 0; v < 256; v++) {
+    wB += h2[v]; if (!wB) continue; const wF = total - wB; if (!wF) break;
+    sB += v * h2[v]; const mB = sB / wB, mF = (sum - sB) / wF, between = wB * wF * (mB - mF) ** 2;
+    if (between > best) { best = between; th = v; }
+  }
+  for (let i = 0, j = 0; i < d.length; i += 4, j++) { const b = g[j] > th ? 255 : 0; d[i] = d[i+1] = d[i+2] = b; }
+  x.putImageData(img, 0, 0);
+  return c;
+}
+
+/* ---------- AI 視覺辨識(透過你自己的 Apps Script,金鑰不會放在網頁) ---------- */
+async function aiOcr(canvas) {
+  const url = $('sheetUrl').value.trim();
+  if (!url) return false;
+  msg.textContent = '🤖 AI 辨識中,請稍候…';
+  try {
+    const k = Math.min(1, 1280 / Math.max(canvas.width, canvas.height));
+    const c = document.createElement('canvas');
+    c.width = Math.round(canvas.width * k); c.height = Math.round(canvas.height * k);
+    c.getContext('2d').drawImage(canvas, 0, 0, c.width, c.height);
+    const b64 = c.toDataURL('image/jpeg', 0.85).split(',')[1];
+    const res = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+      body: JSON.stringify({ action: 'ocr', image: b64 }) });
+    const r = await res.json();
+    $('raw').textContent = 'AI 回傳:\n' + JSON.stringify(r, null, 2);
+    if (r.error) { msg.textContent = '⚠️ AI 辨識失敗,改用本機 OCR:' + String(r.error).slice(0, 80); return false; }
+    fill({ no: r.no || '', date: r.date || '', seller: r.seller || '', buyer: r.buyer || '', total: r.total ?? '', sales: r.sales ?? '' });
+    msg.textContent = '🤖 AI 辨識完成,請務必核對後再加入清單';
+    return true;
+  } catch (e) {
+    msg.textContent = '⚠️ 無法連線 AI 辨識,改用本機 OCR';
+    return false;
+  }
+}
+
 async function ocrCanvas(canvas) {
+  if (await aiOcr(canvas)) return;
   msg.textContent = 'OCR 辨識中(第一次需下載語言檔,請稍候)…';
-  const { data } = await Tesseract.recognize(canvas, 'chi_tra+eng');
-  const text = data.text.replace(/[ \t]/g, '');
+  const pre = preprocess(canvas);
+  // 第一輪:中英文,抓「統一編號 / 總計」等文字標籤
+  const w1 = await Tesseract.createWorker('chi_tra+eng');
+  await w1.setParameters({ tessedit_pageseg_mode: '6' });
+  const t1 = (await w1.recognize(pre)).data.text; await w1.terminate();
+  // 第二輪:只認數字與英文字母,數字比較不會被認成中文字
+  const w2 = await Tesseract.createWorker('eng');
+  await w2.setParameters({ tessedit_pageseg_mode: '6', tessedit_char_whitelist: '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ-:/$,. ' });
+  const t2 = (await w2.recognize(pre)).data.text; await w2.terminate();
+
+  $('raw').textContent = '【中英文辨識】\n' + t1 + '\n\n【數字辨識】\n' + t2;
+  const text = (t1 + '\n' + t2).replace(/[ \t]/g, '');
   const out = {};
-  // 統編:「統一編號/統編」後面的 8 碼數字
   const ids = [...text.matchAll(/(?:統一?編號|統編)[::]?(\d{8})/g)].map(m => m[1]);
   if (ids.length) { out.seller = ids[0]; if (ids[1]) out.buyer = ids[1]; }
-  else { const any = text.match(/\b\d{8}\b/); if (any) out.seller = any[0]; }
-  // 金額:優先找「總計/合計/總額」後面的數字
   const amt = text.match(/(?:總計|合計|總額|應收|金額)[::NT\$]*([\d,]{2,})/);
   if (amt) out.total = +amt[1].replace(/,/g, '');
-  // 發票號碼(傳統:2 英文 + 8 數字)
   const no = text.match(/[A-Z]{2}[-]?\d{8}/); if (no) out.no = no[0].replace('-', '');
-  // 日期(民國 xxx年xx月xx日 或 西元)
-  const d = text.match(/(\d{2,4})[年\/\-.](\d{1,2})[月\/\-.](\d{1,2})/);
-  if (d) { let y = +d[1]; if (y < 1911) y += 1911; out.date = `${y}-${d[2].padStart(2,'0')}-${d[3].padStart(2,'0')}`; }
+  const dt = text.match(/(\d{2,4})[年\/\-.](\d{1,2})[月\/\-.](\d{1,2})/);
+  if (dt) { let y = +dt[1]; if (y < 1911) y += 1911; out.date = `${y}-${dt[2].padStart(2,'0')}-${dt[3].padStart(2,'0')}`; }
   fill(out);
-  msg.textContent = '⚠️ OCR 結果可能有誤(尤其手寫),請逐欄核對。';
-  console.log(data.text);
+
+  // 候選數字:8 碼(可能是統編)與其他數字(可能是金額),讓使用者點選帶入
+  const cand = new Set();
+  (text.match(/\d{8}/g) || []).forEach(v => cand.add(v));
+  (text.match(/\d{1,3}(?:,\d{3})+|\d{2,7}/g) || []).forEach(v => cand.add(v.replace(/,/g, '')));
+  $('chips').innerHTML = '';
+  [...cand].slice(0, 30).forEach(v => {
+    const b = document.createElement('span'); b.className = 'chip'; b.textContent = v;
+    b.onclick = () => { if (lastInput) { lastInput.value = v; } else msg.textContent = '請先點上方要填的欄位,再點數字'; };
+    $('chips').appendChild(b);
+  });
+  msg.textContent = '⚠️ OCR 結果僅供參考,請核對;不對的欄位可點選欄位後,再點下方候選數字帶入。';
 }
+let lastInput = null;
+document.querySelectorAll('input[id^="f_"]').forEach(i => i.addEventListener('focus', () => { lastInput = i; }));
 $('btnShot').onclick = async () => {
   if (!stream || !video.videoWidth) { msg.textContent = '請先開啟相機,或用「上傳照片」。'; return; }
   const c = document.createElement('canvas');
